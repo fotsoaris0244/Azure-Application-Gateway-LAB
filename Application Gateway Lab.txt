@@ -1,0 +1,74 @@
+# Create a resource Group
+RG=<resource group name>
+az group create --name $RG --location <location>
+
+# Create a vnet and subnet for webservers
+az network vnet create --resource-group $RG --name vehicleAppVnet --address-prefixes 10.0.0.0/16 --subnet-name webServerSubnet --subnet-prefixes 10.0.1.0/24
+
+# Download script for web app of web servers
+git clone https://github.com/MicrosoftDocs/mslearn-load-balance-web-traffic-with-application-gateway module-files
+
+# Create web servers for Obtaining vehicle registration documents
+az vm create --resource-group $RG --name webServer1 --image Ubuntu2204 --admin-username azureuser --generate-ssh-keys --vnet-name vehicleAppVnet --subnet webServerSubnet --public-ip-address "" --nsg "" --custom-data module-files/scripts/vmconfig.sh --no-wait
+
+az vm create --resource-group $RG --name webServer2 --image Ubuntu2204 --admin-username azureuser --generate-ssh-keys --vnet-name vehicleAppVnet --subnet webServerSubnet --public-ip-address "" --nsg "" --custom-data module-files/scripts/vmconfig.sh
+
+# Check creation of web servers
+az vm list --resource-group $RG --show-details --output table
+
+# Create an App Service Instance and Deploy the Driver's License Renewal Site
+# Generate unique app service name
+APPSERVICE="licenserenewal$RANDOM"
+
+# Create an app service plan
+az appservice plan create --resource-group $RG --name vehicleAppServicePlan --sku S1
+
+# Create webapp for Driver's License Renewal Site
+az webapp create --resource-group $RG --name $APPSERVICE --plan vehicleAppServicePlan --deployment-source-url https://github.com/MicrosoftDocs/mslearn-load-balance-web-traffic-with-application-gateway --deployment-source-branch appService
+
+# Create a subnet for application gateway instance
+az network vnet subnet create --resource-group $RG --vnet-name vehicleAppVnet --name appGatewaySubnet --address-prefixes 10.0.0.0/24
+
+# Create Public IP and a dns label for application gateway
+az network public-ip create --resource-group $RG --name appGatewayPublicIp --sku Standard --dns-name vehicleapp${RANDOM}
+
+# Create a WAF Policy
+az network application-gateway waf-policy create --name waf-pol --resource-group $RG --type OWASP --version 3.2
+
+# Create an application gateway instance
+az network application-gateway create --resource-group $RG --name vehicleAppGateway --sku WAF_v2 --capacity 2 --vnet-name vehicleAppVnet --subnet appGatewaySubnet --public-ip-address appGatewayPublicIp --http-settings-protocol Http --http-settings-port 8080 --private-ip-address 10.0.0.4 --frontend-port 8080 --waf-policy waf-pol --priority 100
+
+# Get private ip address for each web servers
+az vm list-ip-addresses --resource-group $RG --name webServer1 --query [0].virtualMachine.network.privateIpAddresses[0] --output tsv
+
+az vm list-ip-addresses --resource-group $RG --name webserver2 --query [0].virtualMachine.network.privateIpAddresses[0] --output tsv
+
+# Create a backend pool for obtaining vehicle registration documents
+az network application-gateway address-pool create --gateway-name vehicleAppGateway --resource-group $RG --name vmPool --servers 10.0.1.4 10.0.1.5
+
+# Create a backend pool for app service
+az network application-gateway address-pool create --resource-group $RG --gateway-name vehicleAppGateway --name appServicePool --servers $APPSERVICE.azurewebsites.net
+
+# Create a frontend port for port 80
+az network application-gateway frontend-port create --resource-group $RG --gateway-name vehicleAppGateway --name port80 --port 80
+
+# Create a listener for frontend-port 80
+az network application-gateway http-listener create --resource-group $RG --name vehicleListener --frontend-port port80 --frontend-ip appGatewayFrontendIP --gateway-name vehicleAppGateway
+
+# Create a probe health
+az network application-gateway probe create --resource-group $RG --gateway-name vehicleAppGateway --name customProbe --path / --interval 15 --threshold 3 --timeout 10 --protocol Http --host-name-from-http-settings true
+
+# Create HTTP settings for using probe
+az network application-gateway http-settings create --resource-group $RG --gateway-name vehicleAppGateway --name appGatewayBackendHttpSettings --host-name-from-backend-pool true --port 80 --probe customProbe
+
+# Create path based mapping rule for backend vmPool
+az network application-gateway url-path-map create --resource-group $RG --gateway-name vehicleAppGateway --name urlPathMap --paths /VehicleRegistration/* --http-settings appGatewayBackendHttpSettings --default-http-settings appGatewayBackendHttpSettings --address-pool vmPool --default-address-pool vmPool
+
+# Create path based mapping rule for backend appServicePool
+az network application-gateway url-path-map rule create --resource-group $RG --gateway-name vehicleAppGateway --name appServiceUrlPathMap --paths /LicenseRenewal/* --http-settings appGatewayBackendHttpSettings --address-pool appServicePool --path-map-name urlPathMap
+
+# Create a routing rule
+az network application-gateway rule create --resource-group $RG --gateway-name vehicleAppGateway --name appServiceRule --priority 200 --http-listener vehicleListener --rule-type PathBasedRouting --address-pool appServicePool --url-path-map urlPathMap
+
+# Dele initial routing rule when creating application gateway instance
+az network application-gateway rule delete --resource-group $RG --gateway-name vehicleAppGateway --name rule1
